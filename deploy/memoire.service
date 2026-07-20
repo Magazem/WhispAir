@@ -1,0 +1,35 @@
+[Unit]
+Description=Memoire Thought-Capture Server
+Documentation=https://github.com/Magazem/WhispAir
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=memoire
+Group=memoire
+WorkingDirectory=/opt/memoire
+ExecStart=/opt/memoire/memoire
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=30s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=memoire
+
+# Data directory
+Environment=MEMOIRE_DATA_DIR=/home/memoire/memoire-data
+
+# Security
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/home/memoire /opt/memoire
+ProtectHome=read-only
+
+# Resource limits
+MemoryMax=512M
+CPUQuota=200%
+
+[Install]
+WantedBy=multi-user.target

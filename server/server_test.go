@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Magazem/WhispAir/server"
 	"github.com/Magazem/WhispAir/server/pipeline"
+	"github.com/Magazem/WhispAir/types"
 	"go.uber.org/zap"
 )
 
@@ -32,7 +32,7 @@ func TestPipelineTextMessage(t *testing.T) {
 	})
 
 	// Create a queue item
-	item := server.QueueItem{
+	item := types.QueueItem{
 		ID:        "test_text_1",
 		Type:      "text",
 		Source:    "test",
@@ -115,7 +115,7 @@ func TestPipelineVoiceMessage(t *testing.T) {
 		Logger:  logger,
 	})
 
-	item := server.QueueItem{
+	item := types.QueueItem{
 		ID:        "test_voice_1",
 		Type:      "voice",
 		Source:    "test",
@@ -161,7 +161,7 @@ func TestPipelineJournalMessage(t *testing.T) {
 		Logger:  logger,
 	})
 
-	item := server.QueueItem{
+	item := types.QueueItem{
 		ID:        "test_journal_1",
 		Type:      "text",
 		Source:    "test",
@@ -211,7 +211,7 @@ func TestReviewChecklist(t *testing.T) {
 	}
 
 	for i, msg := range messages {
-		item := server.QueueItem{
+		item := types.QueueItem{
 			ID:     fmt.Sprintf("review_test_%d", i),
 			Type:   "text",
 			Source: "test",
@@ -262,7 +262,7 @@ func TestAIRouting(t *testing.T) {
 		Logger:  logger,
 	})
 
-	item := server.QueueItem{
+	item := types.QueueItem{
 		ID:     "ai_test_1",
 		Type:   "text",
 		Source: "test",

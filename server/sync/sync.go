@@ -29,23 +29,50 @@ func New(dataDir string, logger *zap.Logger) *Server {
 	}
 }
 
+// cleanPath strips leading whitespace/slashes and resolves the path safely
+func (s *Server) resolvePath(urlPath string) (string, error) {
+	// Strip leading slashes and whitespace
+	urlPath = strings.TrimLeft(urlPath, "/ \t")
+	if urlPath == "" {
+		return "", fmt.Errorf("empty path")
+	}
+
+	// filepath.Clean normalizes the path (converts / to \ on Windows, removes ..)
+	cleanPath := filepath.Clean(urlPath)
+	fullPath := filepath.Join(s.dataDir, cleanPath)
+
+	// Ensure we're still within dataDir (prevent path traversal)
+	if !strings.HasPrefix(fullPath, s.dataDir) {
+		return "", fmt.Errorf("path escapes data directory")
+	}
+
+	return fullPath, nil
+}
+
 // ListFiles returns a list of all files in the data directory
 func (s *Server) ListFiles(c *gin.Context) {
 	var files []FileInfo
 
-	err := filepath.Walk(s.dataDir, func(path string, info os.FileInfo, err error) error {
+	if err := filepath.Walk(s.dataDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return nil
+			return nil // Skip errors
 		}
 		if info.IsDir() {
 			return nil
 		}
 
-		// Skip hidden directories
-		rel, _ := filepath.Rel(s.dataDir, path)
-		if strings.HasPrefix(rel, ".") || strings.Contains(rel, "/.") {
+		rel, err := filepath.Rel(s.dataDir, path)
+		if err != nil {
 			return nil
 		}
+
+		// Skip hidden directories
+		if strings.HasPrefix(rel, ".") || strings.Contains(rel, "\\.") || strings.Contains(rel, "/.") {
+			return nil
+		}
+
+		// Normalize to forward slashes in response
+		rel = strings.ReplaceAll(rel, "\\", "/")
 
 		files = append(files, FileInfo{
 			Path:    rel,
@@ -54,9 +81,7 @@ func (s *Server) ListFiles(c *gin.Context) {
 		})
 
 		return nil
-	})
-
-	if err != nil {
+	}); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -72,13 +97,9 @@ func (s *Server) GetFile(c *gin.Context) {
 		return
 	}
 
-	// Clean and validate path
-	cleanPath := filepath.Clean(filePath)
-	fullPath := filepath.Join(s.dataDir, cleanPath)
-
-	// Ensure we're still within dataDir
-	if !strings.HasPrefix(fullPath, s.dataDir) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "invalid path"})
+	fullPath, err := s.resolvePath(filePath)
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -104,15 +125,12 @@ func (s *Server) PutFile(c *gin.Context) {
 		return
 	}
 
-	cleanPath := filepath.Clean(filePath)
-	fullPath := filepath.Join(s.dataDir, cleanPath)
-
-	if !strings.HasPrefix(fullPath, s.dataDir) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "invalid path"})
+	fullPath, err := s.resolvePath(filePath)
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
 		return
 	}
 
-	// Ensure parent directory exists
 	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -129,7 +147,7 @@ func (s *Server) PutFile(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"ok": true, "path": cleanPath})
+	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
 // AppendFile appends content to a file
@@ -140,11 +158,9 @@ func (s *Server) AppendFile(c *gin.Context) {
 		return
 	}
 
-	cleanPath := filepath.Clean(filePath)
-	fullPath := filepath.Join(s.dataDir, cleanPath)
-
-	if !strings.HasPrefix(fullPath, s.dataDir) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "invalid path"})
+	fullPath, err := s.resolvePath(filePath)
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -171,7 +187,7 @@ func (s *Server) AppendFile(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"ok": true, "path": cleanPath})
+	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
 // DeleteFile deletes a file
@@ -182,11 +198,9 @@ func (s *Server) DeleteFile(c *gin.Context) {
 		return
 	}
 
-	cleanPath := filepath.Clean(filePath)
-	fullPath := filepath.Join(s.dataDir, cleanPath)
-
-	if !strings.HasPrefix(fullPath, s.dataDir) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "invalid path"})
+	fullPath, err := s.resolvePath(filePath)
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -199,7 +213,7 @@ func (s *Server) DeleteFile(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"ok": true, "path": cleanPath, "deleted": true})
+	c.JSON(http.StatusOK, gin.H{"ok": true, "deleted": true})
 }
 
 // LogCorrection logs an edit/correction made to AI content (for fine-tuning)
@@ -220,7 +234,6 @@ func (s *Server) LogCorrection(c *gin.Context) {
 		correction.Timestamp = time.Now().UTC().Format(time.RFC3339)
 	}
 
-	// Append to corrections.jsonl
 	trainingDir := filepath.Join(s.dataDir, "training")
 	os.MkdirAll(trainingDir, 0755)
 
@@ -232,7 +245,6 @@ func (s *Server) LogCorrection(c *gin.Context) {
 	}
 	defer f.Close()
 
-	// Log as JSONL
 	line := fmt.Sprintf(`{"timestamp":"%s","file_path":"%s","original":%q,"corrected":%q}`+"\n",
 		correction.Timestamp, correction.FilePath,
 		correction.Original, correction.Corrected)

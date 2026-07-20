@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -67,29 +67,35 @@ func main() {
 	}
 	defer logger.Sync()
 
-	logger.Info("starting memoire server",
-		zap.String("version", "0.1.0"),
-		zap.String("host", viper.GetString("server.host")),
-		zap.String("port", viper.GetString("server.port")),
-	)
-
-	// Create data directory and subdirs
+	// Resolve and create data directory
 	dataDir := viper.GetString("data.dir")
+	dataDir, err = filepath.Abs(dataDir)
+	if err != nil {
+		logger.Fatal("failed to resolve data dir", zap.Error(err))
+	}
+
 	subdirs := []string{
 		"media", "media/transcripts", "brain", "journal",
 		"habits", "training", "archive",
 	}
 	for _, sd := range subdirs {
-		os.MkdirAll(joinPath(dataDir, sd), 0755)
+		os.MkdirAll(filepath.Join(dataDir, sd), 0755)
 	}
 
 	// Create initial files
-	ensureFile(joinPath(dataDir, "Chat.md"), "# Chat\n\n")
-	ensureFile(joinPath(dataDir, "Review.md"), "# Review\n\nAI-extracted items awaiting review. Empty = inbox zero.\n\n")
-	ensureFile(joinPath(dataDir, "Later.md"), "# Later\n\nTasks and actionable items.\n\n")
-	ensureFile(joinPath(dataDir, "Read.md"), "# Read\n\n")
-	ensureFile(joinPath(dataDir, "Watch.md"), "# Watch\n\n")
-	ensureFile(joinPath(dataDir, "Shop.md"), "# Shop\n\n")
+	ensureFile(filepath.Join(dataDir, "Chat.md"), "# Chat\n\n")
+	ensureFile(filepath.Join(dataDir, "Review.md"), "# Review\n\nAI-extracted items awaiting review. Empty = inbox zero.\n\n")
+	ensureFile(filepath.Join(dataDir, "Later.md"), "# Later\n\nTasks and actionable items.\n\n")
+	ensureFile(filepath.Join(dataDir, "Read.md"), "# Read\n\n")
+	ensureFile(filepath.Join(dataDir, "Watch.md"), "# Watch\n\n")
+	ensureFile(filepath.Join(dataDir, "Shop.md"), "# Shop\n\n")
+
+	logger.Info("starting memoire server",
+		zap.String("version", "0.1.0"),
+		zap.String("host", viper.GetString("server.host")),
+		zap.String("port", viper.GetString("server.port")),
+		zap.String("data_dir", dataDir),
+	)
 
 	// Initialize server
 	srv := server.New(server.Config{
@@ -150,9 +156,6 @@ func main() {
 
 	go srv.StartPipeline(ctx)
 
-	// Handle SIGHUP for config reload
-	go handleSIGHUP(logger)
-
 	// Start HTTP server
 	addr := fmt.Sprintf("%s:%s",
 		viper.GetString("server.host"),
@@ -191,24 +194,14 @@ func loggingMiddleware(logger *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
 		path := c.Request.URL.Path
-		raw := c.Request.URL.RawQuery
 
 		c.Next()
 
 		latency := time.Since(start)
-		clientIP := c.ClientIP()
-		method := c.Request.Method
-		statusCode := c.Writer.Status()
-
-		if raw != "" {
-			path = path + "?" + raw
-		}
-
 		logger.Info("request",
-			zap.String("client_ip", clientIP),
-			zap.String("method", method),
+			zap.String("method", c.Request.Method),
 			zap.String("path", path),
-			zap.Int("status", statusCode),
+			zap.Int("status", c.Writer.Status()),
 			zap.Duration("latency", latency),
 		)
 	}
@@ -227,21 +220,6 @@ func corsMiddleware() gin.HandlerFunc {
 
 		c.Next()
 	}
-}
-
-func handleSIGHUP(logger *zap.Logger) {
-	// On SIGHUP, could reload prompts.yaml
-	// For now, just log
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGHUP)
-	for range sigCh {
-		logger.Info("SIGHUP received - prompts reload would happen here")
-	}
-}
-
-// joinPath joins path elements using forward slashes (works on all platforms)
-func joinPath(elem ...string) string {
-	return strings.Replace(strings.Join(elem, "/"), "\\", "/", -1)
 }
 
 func ensureFile(path, header string) {

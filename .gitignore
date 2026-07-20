@@ -1,0 +1,12 @@
+# Test data directories
+test-data*/
+test-data-*/
+memoire_local.exe
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store

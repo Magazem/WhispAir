@@ -2,142 +2,140 @@ package pipeline
 
 import (
 	"context"
-	"fmt"
+	"strings"
 	"time"
 
+	"github.com/Magazem/WhispAir/server/llm"
 	"github.com/Magazem/WhispAir/types"
 	"go.uber.org/zap"
 )
 
-// Extractor handles extracting structured items from text
 type Extractor struct {
-	logger *zap.Logger
+	logger  *zap.Logger
+	llm     llm.Client
+	prompts *PromptLoader
 }
 
-// NewExtractor creates a new extractor
-func NewExtractor(logger *zap.Logger) *Extractor {
+func NewExtractor(logger *zap.Logger, l llm.Client, p *PromptLoader) *Extractor {
+	return &Extractor{logger: logger, llm: l, prompts: p}
+}
+
+func (e *Extractor) Extract(ctx context.Context, text string, category string) ([]types.ExtractedItem, error) {
+	if e.llm != nil {
+		items, err := e.llm.Extract(ctx, text, category)
+		if err == nil {
+			return items, nil
+		}
+		e.logger.Warn("LLM extract failed, using fallback", zap.Error(err))
+	}
+	return extractByKeywords(text, category), nil
+}
+
+type Critic struct {
+	logger *zap.Logger
+	llm    llm.Client
+}
+
+func NewCritic(logger *zap.Logger, l llm.Client) *Critic {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	return &Extractor{logger: logger}
+	return &Critic{logger: logger, llm: l}
 }
 
-// Extract items from text based on category
-func (e *Extractor) Extract(ctx context.Context, text string, category string) ([]types.ExtractedItem, error) {
-	e.logger.Debug("extracting", zap.String("category", category), zap.String("text", text))
+func (c *Critic) Review(ctx context.Context, text string, items []types.ExtractedItem) ([]types.ExtractedItem, error) {
+	if c.llm != nil {
+		refined, err := c.llm.Critic(ctx, text, items)
+		if err == nil {
+			return refined, nil
+		}
+		c.logger.Warn("LLM critic failed, skipping", zap.Error(err))
+	}
+	return items, nil
+}
 
-	items := []types.ExtractedItem{}
-
-	// Split into sentences
-	sentences := splitSentences(text)
-
-	for _, s := range sentences {
-		s = trimSpace(s)
+func extractByKeywords(text string, category string) []types.ExtractedItem {
+	var items []types.ExtractedItem
+	for _, s := range splitSentences(text) {
+		s = strings.TrimSpace(s)
 		if s == "" {
 			continue
 		}
 
-		itemType := category
+		t := category
 		target := "Chat.md"
-
 		switch category {
 		case "task":
 			target = "Later.md"
 		case "idea":
 			target = "brain/" + sanitizeFilename(s) + ".md"
 		case "journal":
-			target = "journal/" + currentMonthFile()
+			target = "journal/" + time.Now().Format("2006.01") + " " + monthName(time.Now().Month()) + ".md"
 		case "mixed":
-			// Classify each sentence
-			cl := classifyByKeywords(s)
-			itemType = cl.Category
-			switch itemType {
+			t = classifyByKeywords(s).Category
+			switch t {
 			case "task":
 				target = "Later.md"
 			case "idea":
 				target = "brain/" + sanitizeFilename(s) + ".md"
 			case "journal":
-				target = "journal/" + currentMonthFile()
-			default:
-				target = "Chat.md"
+				target = "journal/" + time.Now().Format("2006.01") + " " + monthName(time.Now().Month()) + ".md"
 			}
 		}
-
-		items = append(items, types.ExtractedItem{
-			Type:   itemType,
-			Text:   s,
-			Target: target,
-		})
+		items = append(items, types.ExtractedItem{Type: t, Text: s, Target: target})
 	}
-
-	return items, nil
+	return items
 }
 
-// Helper functions
 func splitSentences(text string) []string {
 	if text == "" {
 		return nil
 	}
-	var sentences []string
-	start := 0
-	hasContent := false
+	var out []string
+	start, hasContent := 0, false
 	for i := 0; i < len(text); i++ {
-		c := text[i]
-		if c == '.' || c == '!' || c == '?' {
+		switch text[i] {
+		case '.', '!', '?':
 			if hasContent {
-				sentences = append(sentences, text[start:i+1])
+				out = append(out, text[start:i+1])
 			}
-			start = i + 1
-			hasContent = false
-		} else if c != ' ' && c != '\t' && c != '\n' {
+			start, hasContent = i+1, false
+		case ' ', '\t', '\n':
+		default:
 			hasContent = true
 		}
 	}
-	// Add remaining text if there is content
 	if start < len(text) && hasContent {
-		sentences = append(sentences, text[start:])
+		out = append(out, text[start:])
 	}
-	return sentences
-}
-
-func trimSpace(s string) string {
-	start := 0
-	end := len(s)
-	for start < end && (s[start] == ' ' || s[start] == '\t' || s[start] == '\n') {
-		start++
-	}
-	for end > start && (s[end-1] == ' ' || s[end-1] == '\t' || s[end-1] == '\n') {
-		end--
-	}
-	return s[start:end]
+	return out
 }
 
 func sanitizeFilename(s string) string {
-	result := ""
+	var sb strings.Builder
 	for _, r := range s {
 		c := byte(r)
-		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' {
-			result += string(c)
-		} else if c == ' ' {
-			result += "-"
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '-', c == '_':
+			sb.WriteByte(c)
+		case c == ' ':
+			sb.WriteByte('-')
 		}
-		if len(result) > 50 {
+		if sb.Len() > 50 {
 			break
 		}
 	}
-	if result == "" {
-		result = "untitled"
+	if sb.Len() == 0 {
+		return "untitled"
 	}
-	return result
+	return sb.String()
 }
 
-func currentMonthFile() string {
-	now := time.Now()
-	names := []string{"January", "February", "March", "April", "May", "June",
-		"July", "August", "September", "October", "November", "December"}
-	m := now.Month() - 1
-	if m < 0 || m > 11 {
-		m = 0
+func monthName(m time.Month) string {
+	names := []string{"January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"}
+	i := int(m) - 1
+	if i < 0 || i > 11 {
+		i = 0
 	}
-	return fmt.Sprintf("%d.%02d %s.md", now.Year(), now.Month(), names[m])
+	return names[i]
 }

@@ -3,14 +3,15 @@ package plugins
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/Magazem/WhispAir/types"
 	"go.uber.org/zap"
 )
 
-// Plugin interface for extending the server
 type Plugin interface {
 	Name() string
 	CanHandle(msgType string) bool
@@ -18,17 +19,15 @@ type Plugin interface {
 	PostProcess(item *types.QueueItem, result *types.PipelineResult) error
 }
 
-// registry holds all registered plugins
-var registry []Plugin
+var registry []List
 
-// Register adds a plugin to the global registry
-func Register(p Plugin) {
-	registry = append(registry, p)
+type List struct {
+	name    string
+	handler func(*Plugin) Plugin
 }
 
-// GetRegistry returns all registered plugins
-func GetRegistry() []Plugin {
-	return registry
+func Register(p Plugin) {
+	registry = append(registry, List{name: p.Name(), handler: func(pp *Plugin) Plugin { return *pp }})
 }
 
 func init() {
@@ -38,137 +37,83 @@ func init() {
 }
 
 // VoicePlugin handles voice messages
-type VoicePlugin struct {
-	logger *zap.Logger
-}
+type VoicePlugin struct{ logger *zap.Logger }
 
-// Name returns the plugin name
-func (p *VoicePlugin) Name() string {
-	return "voice"
-}
-
-// CanHandle returns true for voice messages
-func (p *VoicePlugin) CanHandle(msgType string) bool {
-	return msgType == "voice"
-}
-
-// PreProcess saves raw audio and creates queue entry
+func (p *VoicePlugin) Name() string               { return "voice" }
+func (p *VoicePlugin) CanHandle(s string) bool     { return s == "voice" }
 func (p *VoicePlugin) PreProcess(item *types.QueueItem) error {
 	if item.MediaPath == "" {
 		return fmt.Errorf("no media path for voice item")
 	}
-
-	// Ensure media directory exists
 	mediaDir := filepath.Dir(item.MediaPath)
 	if err := os.MkdirAll(mediaDir, 0755); err != nil {
 		return fmt.Errorf("failed to create media dir: %w", err)
 	}
-
-	p.logger.Info("voice pre-process",
-		zap.String("id", item.ID),
-		zap.String("path", item.MediaPath),
-	)
-
+	p.logger.Info("voice pre-process", zap.String("id", item.ID), zap.String("path", item.MediaPath))
 	return nil
 }
-
-// PostProcess handles post-processing
 func (p *VoicePlugin) PostProcess(item *types.QueueItem, result *types.PipelineResult) error {
-	p.logger.Info("voice post-process",
-		zap.String("id", item.ID),
-		zap.Int("items", len(result.Items)),
-	)
+	p.logger.Info("voice post-process", zap.String("id", item.ID), zap.Int("items", len(result.Items)))
 	return nil
 }
 
 // VideoPlugin handles video messages
-type VideoPlugin struct {
-	logger *zap.Logger
-}
+type VideoPlugin struct{ logger *zap.Logger }
 
-// Name returns the plugin name
-func (p *VideoPlugin) Name() string {
-	return "video"
-}
-
-// CanHandle returns true for video messages
-func (p *VideoPlugin) CanHandle(msgType string) bool {
-	return msgType == "video"
-}
-
-// PreProcess saves video and extracts audio
+func (p *VideoPlugin) Name() string               { return "video" }
+func (p *VideoPlugin) CanHandle(s string) bool     { return s == "video" }
 func (p *VideoPlugin) PreProcess(item *types.QueueItem) error {
 	if item.MediaPath == "" {
 		return fmt.Errorf("no media path for video item")
 	}
-
 	mediaDir := filepath.Dir(item.MediaPath)
 	if err := os.MkdirAll(mediaDir, 0755); err != nil {
 		return fmt.Errorf("failed to create media dir: %w", err)
 	}
 
-	p.logger.Info("video pre-process",
-		zap.String("id", item.ID),
-		zap.String("path", item.MediaPath),
-	)
+	// Strip audio via ffmpeg
+	p.logger.Info("extracting audio", zap.String("id", item.ID), zap.String("video", item.MediaPath))
 
+	audioPath := strings.TrimSuffix(item.MediaPath, filepath.Ext(item.MediaPath)) + ".wav"
+
+	cmd := exec.Command("ffmpeg", "-i", item.MediaPath, "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "-y", audioPath)
+	output, err := cmd.CombinedOutput()
+
+	if err != nil {
+		p.logger.Warn("ffmpeg extraction failed, using mock audio file",
+			zap.Error(err),
+			zap.String("output", string(output)),
+		)
+		return nil // Don't fail; transcriptor will use mock
+	}
+
+	item.MediaPath = audioPath
 	return nil
 }
-
-// PostProcess handles post-processing
 func (p *VideoPlugin) PostProcess(item *types.QueueItem, result *types.PipelineResult) error {
-	p.logger.Info("video post-process",
-		zap.String("id", item.ID),
-		zap.Int("items", len(result.Items)),
-	)
+	p.logger.Info("video post-process", zap.String("id", item.ID), zap.Int("items", len(result.Items)))
 	return nil
 }
 
-// ExtractorPlugin orchestrates the LLM pipeline
-type ExtractorPlugin struct {
-	logger *zap.Logger
-}
+// ExtractorPlugin
+type ExtractorPlugin struct{ logger *zap.Logger }
 
-// Name returns the plugin name
-func (p *ExtractorPlugin) Name() string {
-	return "extractor"
-}
-
-// CanHandle returns true for all types
-func (p *ExtractorPlugin) CanHandle(msgType string) bool {
-	return true
-}
-
-// PreProcess is a no-op
-func (p *ExtractorPlugin) PreProcess(item *types.QueueItem) error {
-	return nil
-}
-
-// PostProcess logs extraction results
+func (p *ExtractorPlugin) Name() string               { return "extractor" }
+func (p *ExtractorPlugin) CanHandle(s string) bool     { return true }
+func (p *ExtractorPlugin) PreProcess(item *types.QueueItem) error { return nil }
 func (p *ExtractorPlugin) PostProcess(item *types.QueueItem, result *types.PipelineResult) error {
-	p.logger.Info("extraction complete",
-		zap.String("id", item.ID),
-		zap.Int("items", len(result.Items)),
-		zap.Float64("confidence", result.Confidence),
-	)
+	p.logger.Info("extraction complete", zap.String("id", item.ID), zap.Int("items", len(result.Items)), zap.Float64("confidence", result.Confidence))
 	return nil
 }
 
-// Register registers all memoire plugins
-func RegisterPlugins(srv interface {
+func RegisterPlugins(s interface {
 	RegisterPlugin(Plugin)
 	Logger() *zap.Logger
 }) {
-	logger := srv.Logger()
-	srv.RegisterPlugin(&VoicePlugin{logger: logger})
-	srv.RegisterPlugin(&VideoPlugin{logger: logger})
-	srv.RegisterPlugin(&ExtractorPlugin{logger: logger})
+	logger := s.Logger()
+	s.RegisterPlugin(&VoicePlugin{logger: logger})
+	s.RegisterPlugin(&VideoPlugin{logger: logger})
+	s.RegisterPlugin(&ExtractorPlugin{logger: logger})
 }
 
-// Ensure plugins implement the Plugin interface
-var _ Plugin = (*VoicePlugin)(nil)
-var _ Plugin = (*VideoPlugin)(nil)
-var _ Plugin = (*ExtractorPlugin)(nil)
-
-// Ensure time is used
 var _ = time.Now

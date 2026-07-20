@@ -11,53 +11,69 @@ import (
 	"go.uber.org/zap"
 )
 
-// Transcriber handles audio transcription
+// Transcriber handles audio transcription via whisper.cpp
 type Transcriber struct {
 	config TranscriberConfig
 	logger *zap.Logger
 }
 
-// TranscriberConfig for the transcriber
 type TranscriberConfig struct {
 	WhisperPath string
 	Logger      *zap.Logger
 }
 
-// NewTranscriber creates a new transcriber
 func NewTranscriber(cfg TranscriberConfig) *Transcriber {
 	if cfg.Logger == nil {
 		cfg.Logger = zap.NewNop()
 	}
-	return &Transcriber{
-		config: cfg,
-		logger: cfg.Logger,
-	}
+	return &Transcriber{config: cfg, logger: cfg.Logger}
 }
 
-// Transcribe converts audio to text
 func (t *Transcriber) Transcribe(ctx context.Context, audioPath string) (string, error) {
 	t.logger.Info("transcribing", zap.String("path", audioPath))
 
-	if t.config.WhisperPath == "" {
-		// Return mock transcript
-		return mockTranscript(audioPath), nil
+	whisperExe := t.config.WhisperPath
+	if whisperExe == "" {
+		// Look for whisper in common locations
+		candidates := []string{
+			// User-space portable install
+			filepath.Join(os.Getenv("USERPROFILE"), "Portable", "main.exe"),
+			// System path
+			"whisper",
+			"whisper.exe",
+			// Home local
+			filepath.Join(os.Getenv("HOME"), ".local", "bin", "whisper"),
+		}
+		for _, c := range candidates {
+			if _, err := os.Stat(c); err == nil {
+				whisperExe = c
+				break
+			}
+			if path, err := exec.LookPath(c); err == nil {
+				whisperExe = path
+				break
+			}
+		}
 	}
 
-	// Check if file exists
-	if _, err := exec.LookPath(t.config.WhisperPath); err != nil {
-		t.logger.Warn("whisper not found, using mock", zap.Error(err))
+	if whisperExe == "" {
+		t.logger.Warn("whisper not found, using mock")
 		return mockTranscript(audioPath), nil
 	}
 
 	// Build whisper command
 	outputDir := filepath.Dir(audioPath)
-	cmd := exec.CommandContext(ctx, t.config.WhisperPath,
-		"-m", filepath.Join(filepath.Dir(t.config.WhisperPath), "models", "ggml-medium.bin"),
-		"-f", audioPath,
-		"--output-dir", outputDir,
-		"--output-format", "txt",
-	)
+	baseName := strings.TrimSuffix(filepath.Base(audioPath), filepath.Ext(audioPath))
 
+	// Default model path
+	modelPath := filepath.Join(filepath.Dir(whisperExe), "models", "ggml-medium.bin")
+	if _, err := os.Stat(modelPath); err != nil {
+		modelPath = filepath.Join(filepath.Dir(whisperExe), "ggml-medium.bin")
+	}
+
+	args := []string{"-m", modelPath, "-f", audioPath, "--output-dir", outputDir, "--output-format", "txt"}
+
+	cmd := exec.CommandContext(ctx, whisperExe, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.logger.Error("whisper failed", zap.Error(err), zap.String("output", string(output)))
@@ -65,7 +81,7 @@ func (t *Transcriber) Transcribe(ctx context.Context, audioPath string) (string,
 	}
 
 	// Read the output file
-	txtFile := strings.TrimSuffix(audioPath, filepath.Ext(audioPath)) + ".txt"
+	txtFile := filepath.Join(outputDir, baseName+".txt")
 	content, err := os.ReadFile(txtFile)
 	if err != nil {
 		t.logger.Warn("failed to read transcript file", zap.Error(err))
@@ -75,10 +91,8 @@ func (t *Transcriber) Transcribe(ctx context.Context, audioPath string) (string,
 	return string(content), nil
 }
 
-// mockTranscript returns a mock transcription for demo/testing
 func mockTranscript(audioPath string) string {
-	// Return different mock content based on filename
-	if strings.Contains(audioPath, "voice_msg") {
+	if strings.Contains(audioPath, "voice_msg") || strings.Contains(audioPath, "voice") {
 		return "Idea about glass-ai scout mode trigger. Consider how to detect context switching when wearing the glasses. Maybe use the accelerometer data to determine when the user is focusing on something specific."
 	}
 	return fmt.Sprintf("This is a mock transcription for file %s. It contains some thoughts about improving the system architecture. Maybe we should consider using a different approach for handling voice messages.", filepath.Base(audioPath))

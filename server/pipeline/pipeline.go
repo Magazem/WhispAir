@@ -10,7 +10,6 @@ import (
 	"go.uber.org/zap"
 )
 
-// Config for the pipeline
 type Config struct {
 	DataDir     string
 	Logger      *zap.Logger
@@ -19,7 +18,6 @@ type Config struct {
 	LLMClient   llm.Client
 }
 
-// Pipeline orchestrates the full processing pipeline
 type Pipeline struct {
 	config      Config
 	logger      *zap.Logger
@@ -29,42 +27,40 @@ type Pipeline struct {
 	extractor   *Extractor
 	critic      *Critic
 	router      *Router
+	prompts     *PromptLoader
+	llm         llm.Client
 }
 
-// New creates a new Pipeline
 func New(cfg Config) *Pipeline {
 	logger := cfg.Logger
 	if logger == nil {
 		logger = zap.NewNop()
 	}
 
-	dataDir := cfg.DataDir
+	// Initialize prompt loader
+	promptsPath := filepath.Join("server", "pipeline", "prompts.yaml")
+	if _, err := os.Stat(promptsPath); err != nil {
+		// Fallback to current directory
+		promptsPath = "prompts.yaml"
+	}
+	prompts := NewPromptLoader(promptsPath, logger)
 
 	return &Pipeline{
-		config:  cfg,
-		logger:  logger,
-		dataDir: dataDir,
-		transcriber: NewTranscriber(TranscriberConfig{
-			WhisperPath: cfg.WhisperPath,
-			Logger:      logger,
-		}),
-		classifier: NewClassifier(logger),
-		extractor:  NewExtractor(logger),
-		critic:     NewCritic(logger),
-		router:     NewRouter(dataDir, logger),
+		config:      cfg,
+		logger:      logger,
+		dataDir:     cfg.DataDir,
+		transcriber: NewTranscriber(TranscriberConfig{WhisperPath: cfg.WhisperPath, Logger: logger}),
+		classifier:  NewClassifier(logger, cfg.LLMClient, prompts),
+		extractor:   NewExtractor(logger, cfg.LLMClient, prompts),
+		critic:      NewCritic(logger, cfg.LLMClient),
+		router:     NewRouter(cfg.DataDir, logger),
+		prompts:    prompts,
+		llm:        cfg.LLMClient,
 	}
 }
 
-// Process runs the full pipeline on an item
 func (p *Pipeline) Process(ctx context.Context, item types.QueueItem) (*types.PipelineResult, error) {
-	p.logger.Info("pipeline start",
-		zap.String("id", item.ID),
-		zap.String("type", item.Type),
-	)
-
-	result := &types.PipelineResult{
-		Items: []types.ExtractedItem{},
-	}
+	result := &types.PipelineResult{Items: []types.ExtractedItem{}}
 
 	// Step 1: Get text (transcribe if needed)
 	var text string
@@ -72,27 +68,18 @@ func (p *Pipeline) Process(ctx context.Context, item types.QueueItem) (*types.Pi
 
 	switch item.Type {
 	case "voice", "video":
-		// Transcribe audio
 		text, err = p.transcriber.Transcribe(ctx, item.MediaPath)
 		if err != nil {
-			// Log but don't fail - use fallback text
-			p.logger.Error("transcription failed, using fallback",
-				zap.Error(err),
-				zap.String("id", item.ID),
-			)
+			p.logger.Error("transcription failed", zap.Error(err))
 			text = "[voice message]"
 		}
-
-		// Save transcript for posterity
 		if saveErr := p.saveTranscript(item.ID, text); saveErr != nil {
 			p.logger.Warn("failed to save transcript", zap.Error(saveErr))
 		}
-
 	case "text":
 		text = item.Text
-
 	default:
-		return nil, unsupportedTypeError(item.Type)
+		return nil, &pipelineError{msg: "unsupported item type: " + item.Type}
 	}
 
 	result.RawText = text
@@ -104,60 +91,32 @@ func (p *Pipeline) Process(ctx context.Context, item types.QueueItem) (*types.Pi
 	// Step 3: Extract
 	items, err := p.extractor.Extract(ctx, text, classification.Category)
 	if err != nil {
-		return nil, extractionError(err)
+		return nil, &pipelineError{msg: "extraction failed: " + err.Error()}
 	}
 
-	// Step 4: Cognitive critic pass (refine)
-	refinedItems, err := p.critic.Critic(ctx, text, items)
+	// Step 4: Critic
+	refinedItems, err := p.critic.Review(ctx, text, items)
 	if err != nil {
-		p.logger.Warn("critic pass failed, using unrefined", zap.Error(err))
+		p.logger.Warn("critic failed, using unrefined", zap.Error(err))
 		refinedItems = items
 	}
 
-	// Step 5: Route items to target files and Review.md
+	// Step 5: Route
 	if err := p.router.Route(ctx, item, refinedItems); err != nil {
-		return nil, routingError(err)
+		return nil, &pipelineError{msg: "routing failed: " + err.Error()}
 	}
 
 	result.Items = refinedItems
 	result.Confidence = classification.Confidence
-
-	p.logger.Info("pipeline complete",
-		zap.String("id", item.ID),
-		zap.Int("items", len(result.Items)),
-		zap.Float64("confidence", result.Confidence),
-	)
-
 	return result, nil
 }
 
-// saveTranscript preserves the raw transcript forever
 func (p *Pipeline) saveTranscript(id, text string) error {
 	dir := filepath.Join(p.dataDir, "media", "transcripts")
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
-	}
-
-	filename := id + ".txt"
-	return os.WriteFile(filepath.Join(dir, filename), []byte(text), 0644)
+	os.MkdirAll(dir, 0755)
+	return os.WriteFile(filepath.Join(dir, id+".txt"), []byte(text), 0644)
 }
 
-func unsupportedTypeError(t string) error {
-	return &pipelineError{msg: "unsupported item type: " + t}
-}
+type pipelineError struct{ msg string }
 
-func extractionError(err error) error {
-	return &pipelineError{msg: "extraction failed: " + err.Error()}
-}
-
-func routingError(err error) error {
-	return &pipelineError{msg: "routing failed: " + err.Error()}
-}
-
-type pipelineError struct {
-	msg string
-}
-
-func (e *pipelineError) Error() string {
-	return e.msg
-}
+func (e *pipelineError) Error() string { return e.msg }

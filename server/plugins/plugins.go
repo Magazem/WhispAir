@@ -60,7 +60,11 @@ func (p *VoicePlugin) PostProcess(item *types.QueueItem, result *types.PipelineR
 // VideoPlugin handles video messages
 type VideoPlugin struct{ logger *zap.Logger }
 
-func (p *VideoPlugin) Name() string               { return "video" }
+func NewVideoPlugin(logger *zap.Logger) *VideoPlugin {
+	return &VideoPlugin{logger: logger}
+}
+
+func (p *VideoPlugin) Name() string    { return "video" }
 func (p *VideoPlugin) CanHandle(s string) bool     { return s == "video" }
 func (p *VideoPlugin) PreProcess(item *types.QueueItem) error {
 	if item.MediaPath == "" {

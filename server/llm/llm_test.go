@@ -66,7 +66,7 @@ func TestClassifySendsFormatJSON(t *testing.T) {
 	rec := &requestRecorder{}
 	server := newStubServer(func(w http.ResponseWriter, r *http.Request, rec *requestRecorder) {
 		w.WriteHeader(200)
-		io.WriteString(w, `{"response": "{\"category\":\"task\",\"confidence\":0.9\"}"}`)
+		io.WriteString(w, `{"response": "{\"category\":\"task\",\"confidence\":0.9}"}`)
 	}, rec)
 	defer server.Close()
 
@@ -138,7 +138,7 @@ func TestRetryLoop(t *testing.T) {
 			io.WriteString(w, `{"response": "this is not valid json"}`)
 		} else {
 			// Return valid JSON on the third attempt.
-			io.WriteString(w, `{"response": "{\"category\":\"idea\",\"confidence\":0.8\"}"}`)
+			io.WriteString(w, `{"response": "{\"category\":\"idea\",\"confidence\":0.8}"}`)
 		}
 	}, rec)
 	defer server.Close()
@@ -290,7 +290,7 @@ func TestStripThinkBlocks(t *testing.T) {
 	rec := &requestRecorder{}
 	server := newStubServer(func(w http.ResponseWriter, r *http.Request, rec *requestRecorder) {
 		w.WriteHeader(200)
-		io.WriteString(w, `{"response": "<think>\nI need to classify this.\n</think>{\"category\":\"journal\",\"confidence\":0.7\"}"}`)
+		io.WriteString(w, `{"response": "<think>\nI need to classify this.\n</think>{\"category\":\"journal\",\"confidence\":0.7}"}`)
 	}, rec)
 	defer server.Close()
 

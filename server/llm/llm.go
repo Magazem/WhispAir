@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/Magazem/WhispAir/types"
@@ -30,19 +31,29 @@ type Config struct {
 	OllamaHost string
 	ClaudeKey  string
 	Logger     *zap.Logger
+	// AllowMock permits falling back to keyword-based mock results when the
+	// LLM is unavailable. When false, errors propagate to the caller.
+	AllowMock bool
 }
 
-// NewClient creates a new LLM client
+// NewClient creates a new LLM client with AllowMock=false.
+// Kept for backward compatibility — server.go calls this.
 func NewClient(ollamaHost, claudeKey string, logger *zap.Logger) Client {
-	if logger == nil {
-		logger = zap.NewNop()
+	return NewClientWithOptions(Config{
+		OllamaHost: ollamaHost,
+		ClaudeKey:  claudeKey,
+		Logger:     logger,
+		AllowMock:  false,
+	})
+}
+
+// NewClientWithOptions creates a new LLM client with full configuration.
+func NewClientWithOptions(cfg Config) Client {
+	if cfg.Logger == nil {
+		cfg.Logger = zap.NewNop()
 	}
 	return &DefaultClient{
-		config: Config{
-			OllamaHost: ollamaHost,
-			ClaudeKey:  claudeKey,
-			Logger:     logger,
-		},
+		config: cfg,
 		httpClient: &http.Client{
 			Timeout: 120 * time.Second,
 		},
@@ -53,42 +64,112 @@ func NewClient(ollamaHost, claudeKey string, logger *zap.Logger) Client {
 func (c *DefaultClient) Classify(ctx context.Context, text string) (types.Classification, error) {
 	c.config.Logger.Debug("classify", zap.String("text", text))
 
-	// Try local Ollama first
 	result, err := c.classifyOllama(ctx, text)
 	if err == nil {
 		return result, nil
 	}
 
-	c.config.Logger.Warn("ollama classify failed, using mock", zap.Error(err))
-	return mockClassify(text), nil
+	if c.config.AllowMock {
+		c.config.Logger.Warn("MOCK LLM - not real inference")
+		return mockClassify(text), nil
+	}
+
+	return types.Classification{}, err
 }
 
 // Extract items from text
 func (c *DefaultClient) Extract(ctx context.Context, text string, category string) ([]types.ExtractedItem, error) {
 	c.config.Logger.Debug("extract", zap.String("category", category))
 
-	// Try local Ollama first
 	items, err := c.extractOllama(ctx, text, category)
 	if err == nil {
 		return items, nil
 	}
 
-	c.config.Logger.Warn("ollama extract failed, using mock", zap.Error(err))
-	return mockExtract(text, category), nil
+	if c.config.AllowMock {
+		c.config.Logger.Warn("MOCK LLM - not real inference")
+		return mockExtract(text, category), nil
+	}
+
+	return nil, err
 }
 
 // Critically review and refine items
 func (c *DefaultClient) Critic(ctx context.Context, text string, items []types.ExtractedItem) ([]types.ExtractedItem, error) {
 	c.config.Logger.Debug("critic", zap.Int("items", len(items)))
 
-	// Try local Ollama first
 	refined, err := c.criticOllama(ctx, text, items)
 	if err == nil {
 		return refined, nil
 	}
 
-	c.config.Logger.Warn("ollama critic failed, using mock", zap.Error(err))
-	return items, nil
+	if c.config.AllowMock {
+		c.config.Logger.Warn("MOCK LLM - not real inference")
+		return items, nil
+	}
+
+	return nil, err
+}
+
+// callOllamaWithRetry sends a prompt to Ollama and parses the response with
+// parseFunc. On parse failure it appends the raw response and the error to the
+// prompt and retries, up to 3 attempts total. Every attempt is logged.
+func (c *DefaultClient) callOllamaWithRetry(
+	ctx context.Context,
+	model string,
+	basePrompt string,
+	parseFunc func(raw string) error,
+) error {
+	var lastErr error
+	var lastRaw string
+
+	for attempt := 1; attempt <= 3; attempt++ {
+		prompt := basePrompt
+		if attempt > 1 {
+			// Feed the previous raw response and parse error back into the prompt.
+			prompt = basePrompt + fmt.Sprintf(
+				"\n\nPrevious attempt returned invalid JSON.\nRaw response: %s\nParse error: %s\nPlease return ONLY valid JSON, no other text.",
+				lastRaw, lastErr,
+			)
+		}
+
+		reqBody := map[string]interface{}{
+			"model":  model,
+			"prompt": prompt,
+			"stream": false,
+			"format": "json",
+		}
+
+		var resp struct {
+		 Response string `json:"response"`
+		}
+
+		if err := c.doOllamaRequest(ctx, "/api/generate", reqBody, &resp); err != nil {
+			lastErr = err
+			c.config.Logger.Warn("ollama request failed",
+				zap.Int("attempt", attempt),
+				zap.Error(err),
+			)
+			continue
+		}
+
+		// Defensively strip <think> reasoning blocks Qwen 3 emits even with format:json.
+		raw := stripThinkBlocks(resp.Response)
+		lastRaw = raw
+
+		if err := parseFunc(raw); err != nil {
+			lastErr = err
+			c.config.Logger.Warn("ollama response parse failed",
+				zap.Int("attempt", attempt),
+				zap.Error(err),
+			)
+			continue
+		}
+
+		return nil
+	}
+
+	return fmt.Errorf("ollama call failed after 3 attempts, last error: %w", lastErr)
 }
 
 // classifyOllama calls the local Ollama instance
@@ -97,7 +178,7 @@ func (c *DefaultClient) classifyOllama(ctx context.Context, text string) (types.
 		return types.Classification{}, fmt.Errorf("ollama host not configured")
 	}
 
-	prompt := fmt.Sprintf(`You are a classifier for personal thought-capture messages. Given the message below, classify it into one of these categories:
+	basePrompt := fmt.Sprintf(`You are a classifier for personal thought-capture messages. Given the message below, classify it into one of these categories:
 - task: actionable items, things to do
 - idea: insights, concepts, hunches
 - journal: personal reflections, experiences
@@ -107,23 +188,11 @@ Respond with ONLY a JSON object: {"category": "...", "confidence": 0.0-1.0}
 
 Message: %s`, text)
 
-	reqBody := map[string]interface{}{
-		"model":  "qwen3:0.6b",
-		"prompt": prompt,
-		"stream": false,
-	}
-
-	var resp struct {
-		Response string `json:"response"`
-	}
-
-	if err := c.doOllamaRequest(ctx, "/api/generate", reqBody, &resp); err != nil {
-		return types.Classification{}, err
-	}
-
 	var result types.Classification
-	if err := json.Unmarshal([]byte(resp.Response), &result); err != nil {
-		return types.Classification{}, fmt.Errorf("failed to parse classify response: %w", err)
+	if err := c.callOllamaWithRetry(ctx, "qwen3:0.6b", basePrompt, func(raw string) error {
+		return json.Unmarshal([]byte(raw), &result)
+	}); err != nil {
+		return types.Classification{}, err
 	}
 
 	return result, nil
@@ -135,7 +204,7 @@ func (c *DefaultClient) extractOllama(ctx context.Context, text string, category
 		return nil, fmt.Errorf("ollama host not configured")
 	}
 
-	prompt := fmt.Sprintf(`You are an extractor for personal thought-capture messages. Given the message below and its category "%s", extract structured items.
+	basePrompt := fmt.Sprintf(`You are an extractor for personal thought-capture messages. Given the message below and its category "%s", extract structured items.
 
 For each item:
 - type: "task", "idea", or "journal"
@@ -146,37 +215,40 @@ Respond with ONLY a JSON array: [{"type": "...", "text": "...", "target": "..."}
 
 Message: %s`, category, text)
 
-	reqBody := map[string]interface{}{
-		"model":  "qwen3:8b",
-		"prompt": prompt,
-		"stream": false,
-		"format": "json",
-	}
-
-	var resp struct {
-		Response string `json:"response"`
-	}
-
-	if err := c.doOllamaRequest(ctx, "/api/generate", reqBody, &resp); err != nil {
+	var items []types.ExtractedItem
+	if err := c.callOllamaWithRetry(ctx, "qwen3:8b", basePrompt, func(raw string) error {
+		return json.Unmarshal([]byte(raw), &items)
+	}); err != nil {
 		return nil, err
 	}
 
-	var items []types.ExtractedItem
-	if err := json.Unmarshal([]byte(resp.Response), &items); err != nil {
-		return nil, fmt.Errorf("failed to parse extract response: %w", err)
-	}
-
+	// TODO: set ExtractedItem.Confidence from the model's own confidence once the
+	// field is added to types.ExtractedItem (another task owns that change).
 	return items, nil
 }
 
-// criticOllama calls the local Ollama for criticism
+// criticResponse is the JSON shape the critic model returns.
+type criticResponse struct {
+	Missed []string `json:"missed"`
+	Reclassified []struct {
+		OldType string `json:"old_type"`
+		NewType string `json:"new_type"`
+		Text    string `json:"text"`
+	} `json:"reclassified"`
+	Splittable []struct {
+		Original string   `json:"original"`
+		Parts    []string `json:"parts"`
+	} `json:"splittable"`
+}
+
+// criticOllama calls the local Ollama for criticism and applies the response.
 func (c *DefaultClient) criticOllama(ctx context.Context, text string, items []types.ExtractedItem) ([]types.ExtractedItem, error) {
 	if c.config.OllamaHost == "" {
 		return nil, fmt.Errorf("ollama host not configured")
 	}
 
 	itemsJSON, _ := json.Marshal(items)
-	prompt := fmt.Sprintf(`You are a critic reviewing extracted items from a thought-capture message. For each item, check:
+	basePrompt := fmt.Sprintf(`You are a critic reviewing extracted items from a thought-capture message. For each item, check:
 1. Was anything missed? Return "missed": ["item text"]
 2. Was anything misclassified? Return "reclassified": [{"old_type": "...", "new_type": "...", "text": "..."}]
 3. Can any item be split? Return "splittable": [{"original": "...", "parts": ["..."]}]
@@ -187,23 +259,105 @@ Original message: %s
 
 Extracted items: %s`, text, string(itemsJSON))
 
-	reqBody := map[string]interface{}{
-		"model":  "qwen3:8b",
-		"prompt": prompt,
-		"stream": false,
-		"format": "json",
-	}
-
-	var resp struct {
-		Response string `json:"response"`
-	}
-
-	if err := c.doOllamaRequest(ctx, "/api/generate", reqBody, &resp); err != nil {
+	var cr criticResponse
+	if err := c.callOllamaWithRetry(ctx, "qwen3:8b", basePrompt, func(raw string) error {
+		return json.Unmarshal([]byte(raw), &cr)
+	}); err != nil {
 		return nil, err
 	}
 
-	// For now, return original items
-	return items, nil
+	return applyCritic(items, cr), nil
+}
+
+// applyCritic applies the critic's feedback to the extracted items:
+// appends missed items, reclassifies items, and splits splittable items.
+func applyCritic(items []types.ExtractedItem, cr criticResponse) []types.ExtractedItem {
+	result := make([]types.ExtractedItem, len(items))
+	copy(result, items)
+
+	// Apply reclassifications — change Type and update Target when the
+	// new type implies a different target file.
+	for _, r := range cr.Reclassified {
+		for i := range result {
+			if result[i].Text == r.Text && result[i].Type == r.OldType {
+				result[i].Type = r.NewType
+				switch r.NewType {
+				case "task":
+					result[i].Target = "Later.md"
+				case "idea":
+					result[i].Target = "brain/" + sanitizeFilename(r.Text) + ".md"
+				case "journal":
+					result[i].Target = "journal/" + currentMonthFile()
+				}
+			}
+		}
+	}
+
+	// Apply splittable — replace the original with its parts, preserving
+	// the original item's Type and (where sensible) Target.
+	var expanded []types.ExtractedItem
+	for _, item := range result {
+		split := false
+		for _, s := range cr.Splittable {
+			if item.Text == s.Original {
+				for _, part := range s.Parts {
+					newItem := item
+					newItem.Text = part
+					if item.Type == "idea" {
+						newItem.Target = "brain/" + sanitizeFilename(part) + ".md"
+					}
+					expanded = append(expanded, newItem)
+				}
+				split = true
+				break
+			}
+		}
+		if !split {
+			expanded = append(expanded, item)
+		}
+	}
+	result = expanded
+
+	// Append missed items, routing them by detected type.
+	for _, m := range cr.Missed {
+		itemType := detectTypeFromText(m)
+		target := "Chat.md"
+		switch itemType {
+		case "task":
+			target = "Later.md"
+		case "idea":
+			target = "brain/" + sanitizeFilename(m) + ".md"
+		case "journal":
+			target = "journal/" + currentMonthFile()
+		}
+		result = append(result, types.ExtractedItem{
+			Type:   itemType,
+			Text:   m,
+			Target: target,
+		})
+	}
+
+	return result
+}
+
+// stripThinkBlocks removes <think>...</think> reasoning blocks that Qwen 3
+// emits even when format:json is set. Handles multiple and unclosed blocks.
+func stripThinkBlocks(s string) string {
+	for {
+		start := strings.Index(s, "<think>")
+		if start < 0 {
+			break
+		}
+		rel := strings.Index(s[start:], "</think>")
+		if rel < 0 {
+			// Unclosed block — strip from <think> to end.
+			s = s[:start]
+			break
+		}
+		end := start + rel + len("</think>")
+		s = s[:start] + s[end:]
+	}
+	return s
 }
 
 // doOllamaRequest makes a request to the local Ollama instance

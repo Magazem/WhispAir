@@ -25,9 +25,12 @@ type Classification struct {
 
 // ExtractedItem represents a single extracted piece of content
 type ExtractedItem struct {
-	Type   string `json:"type"`
-	Text   string `json:"text"`
-	Target string `json:"target"`
+	Type        string  `json:"type"`
+	Text        string  `json:"text"`
+	Target      string  `json:"target"`
+	// Confidence carries the classifier's confidence for this item.
+	// Zero means "unknown" and is omitted from AI markers.
+	Confidence float64 `json:"confidence"`
 }
 
 // PipelineResult from the pipeline processing

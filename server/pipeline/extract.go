@@ -14,10 +14,19 @@ type Extractor struct {
 	logger  *zap.Logger
 	llm     llm.Client
 	prompts *PromptLoader
+	// AllowFallback controls whether an LLM failure silently falls back
+	// to keyword extraction. When false, LLM errors are returned to the
+	// caller instead of being swallowed.
+	AllowFallback bool
 }
 
 func NewExtractor(logger *zap.Logger, l llm.Client, p *PromptLoader) *Extractor {
 	return &Extractor{logger: logger, llm: l, prompts: p}
+}
+
+// SetAllowFallback sets whether LLM failures fall back to keyword extraction.
+func (e *Extractor) SetAllowFallback(allow bool) {
+	e.AllowFallback = allow
 }
 
 func (e *Extractor) Extract(ctx context.Context, text string, category string) ([]types.ExtractedItem, error) {
@@ -25,6 +34,10 @@ func (e *Extractor) Extract(ctx context.Context, text string, category string) (
 		items, err := e.llm.Extract(ctx, text, category)
 		if err == nil {
 			return items, nil
+		}
+		if !e.AllowFallback {
+			e.logger.Warn("LLM extract failed, fallback disabled", zap.Error(err))
+			return nil, err
 		}
 		e.logger.Warn("LLM extract failed, using fallback", zap.Error(err))
 	}
@@ -34,6 +47,9 @@ func (e *Extractor) Extract(ctx context.Context, text string, category string) (
 type Critic struct {
 	logger *zap.Logger
 	llm    llm.Client
+	// AllowFallback controls whether an LLM failure silently returns the
+	// unrefined items. When false, LLM errors are returned to the caller.
+	AllowFallback bool
 }
 
 func NewCritic(logger *zap.Logger, l llm.Client) *Critic {
@@ -43,13 +59,22 @@ func NewCritic(logger *zap.Logger, l llm.Client) *Critic {
 	return &Critic{logger: logger, llm: l}
 }
 
+// SetAllowFallback sets whether LLM failures fall back to unrefined items.
+func (c *Critic) SetAllowFallback(allow bool) {
+	c.AllowFallback = allow
+}
+
 func (c *Critic) Review(ctx context.Context, text string, items []types.ExtractedItem) ([]types.ExtractedItem, error) {
 	if c.llm != nil {
 		refined, err := c.llm.Critic(ctx, text, items)
 		if err == nil {
 			return refined, nil
 		}
-		c.logger.Warn("LLM critic failed, skipping", zap.Error(err))
+		if !c.AllowFallback {
+			c.logger.Warn("LLM critic failed, fallback disabled", zap.Error(err))
+			return nil, err
+		}
+		c.logger.Warn("LLM critic failed, using fallback", zap.Error(err))
 	}
 	return items, nil
 }

@@ -1,7 +1,18 @@
 # Test data directories
 test-data*/
 test-data-*/
+
+# Hive orchestrator state (contains API key)
+.hive/
+
+# Build artifacts - binaries must never be tracked
+memoire
+memoire.exe
+memoire-linux
 memoire_local.exe
+
+# Artifact of the unexpanded $HOME data.dir bug; real data lives in ~/memoire-data
+/$HOME/
 
 # IDE
 .vscode/
@@ -10,3 +21,4 @@ memoire_local.exe
 # OS
 Thumbs.db
 .DS_Store
+

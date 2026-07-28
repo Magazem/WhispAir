@@ -15,7 +15,13 @@ type Config struct {
 	Logger      *zap.Logger
 	OllamaHost  string
 	WhisperPath string
-	LLMClient   llm.Client
+	// WhisperModel is the path to the ggml model file.
+	WhisperModel string
+	// AllowMock permits mock transcription and mock LLM output. Defaults to
+	// false so that a broken dependency surfaces as an error instead of
+	// fabricated content in the user's notes.
+	AllowMock bool
+	LLMClient llm.Client
 }
 
 type Pipeline struct {
@@ -45,14 +51,27 @@ func New(cfg Config) *Pipeline {
 	}
 	prompts := NewPromptLoader(promptsPath, logger)
 
+	extractor := NewExtractor(logger, cfg.LLMClient, prompts)
+	critic := NewCritic(logger, cfg.LLMClient)
+
+	// Keyword fallback is a form of fabrication: it turns an LLM failure into
+	// plausible-looking output. Only permit it when mocks are explicitly on.
+	extractor.SetAllowFallback(cfg.AllowMock)
+	critic.SetAllowFallback(cfg.AllowMock)
+
 	return &Pipeline{
-		config:      cfg,
-		logger:      logger,
-		dataDir:     cfg.DataDir,
-		transcriber: NewTranscriber(TranscriberConfig{WhisperPath: cfg.WhisperPath, Logger: logger}),
-		classifier:  NewClassifier(logger, cfg.LLMClient, prompts),
-		extractor:   NewExtractor(logger, cfg.LLMClient, prompts),
-		critic:      NewCritic(logger, cfg.LLMClient),
+		config:  cfg,
+		logger:  logger,
+		dataDir: cfg.DataDir,
+		transcriber: NewTranscriber(TranscriberConfig{
+			WhisperPath: cfg.WhisperPath,
+			ModelPath:   cfg.WhisperModel,
+			AllowMock:   cfg.AllowMock,
+			Logger:      logger,
+		}),
+		classifier: NewClassifier(logger, cfg.LLMClient, prompts),
+		extractor:  extractor,
+		critic:     critic,
 		router:     NewRouter(cfg.DataDir, logger),
 		prompts:    prompts,
 		llm:        cfg.LLMClient,
@@ -70,9 +89,18 @@ func (p *Pipeline) Process(ctx context.Context, item types.QueueItem) (*types.Pi
 	case "voice", "video":
 		text, err = p.transcriber.Transcribe(ctx, item.MediaPath)
 		if err != nil {
-			p.logger.Error("transcription failed", zap.Error(err))
-			text = "[voice message]"
+			// Abort rather than continuing with placeholder text. The old code
+			// substituted "[voice message]" and carried on, so a failed
+			// transcription still produced extracted items and wrote them to
+			// the user's notes. The media file is preserved for a retry.
+			p.logger.Error("transcription failed; aborting item",
+				zap.String("id", item.ID),
+				zap.String("media", item.MediaPath),
+				zap.Error(err),
+			)
+			return nil, &pipelineError{msg: "transcription failed: " + err.Error()}
 		}
+		// Preserve the raw transcript before anything else touches it.
 		if saveErr := p.saveTranscript(item.ID, text); saveErr != nil {
 			p.logger.Warn("failed to save transcript", zap.Error(saveErr))
 		}
@@ -99,6 +127,14 @@ func (p *Pipeline) Process(ctx context.Context, item types.QueueItem) (*types.Pi
 	if err != nil {
 		p.logger.Warn("critic failed, using unrefined", zap.Error(err))
 		refinedItems = items
+	}
+
+	// Stamp the real classification confidence onto each item so the AI
+	// markers carry a true number instead of the hardcoded 0.85 they used to.
+	for i := range refinedItems {
+		if refinedItems[i].Confidence == 0 {
+			refinedItems[i].Confidence = classification.Confidence
+		}
 	}
 
 	// Step 5: Route

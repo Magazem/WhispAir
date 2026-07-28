@@ -14,6 +14,7 @@ import (
 	"github.com/Magazem/WhispAir/server/llm"
 	"github.com/Magazem/WhispAir/server/pipeline"
 	"github.com/Magazem/WhispAir/server/plugins"
+	"github.com/Magazem/WhispAir/server/queue"
 	"github.com/Magazem/WhispAir/types"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
@@ -27,7 +28,19 @@ type Config struct {
 	BotAPIURL   string
 	OllamaHost  string
 	WhisperPath string
-	ClaudeKey   string
+	// WhisperModel is the path to the ggml model file. Empty falls back to
+	// $WHISPER_MODEL and then conventional locations.
+	WhisperModel string
+	ClaudeKey    string
+	// AllowMock permits mock transcription and mock LLM output. It MUST
+	// default to false: mock output is indistinguishable from real captured
+	// thought once it reaches the notes.
+	AllowMock bool
+	// Workers is the number of concurrent pipeline workers. Defaults to 1.
+	// The target hardware holds a single 8B model in 6GB of VRAM, so more
+	// than one concurrent extract means GPU thrash or OOM. The project's
+	// stated priority is correctness over latency.
+	Workers int
 }
 
 // Server is the main memoire server
@@ -39,6 +52,7 @@ type Server struct {
 	pipeline  *pipeline.Pipeline
 	llmClient llm.Client
 	queue     chan types.QueueItem
+	durable   *queue.Queue
 	wg        sync.WaitGroup
 }
 
@@ -49,6 +63,10 @@ func New(cfg Config) *Server {
 		logger = zap.NewNop()
 	}
 
+	if cfg.Workers < 1 {
+		cfg.Workers = 1
+	}
+
 	s := &Server{
 		config:  cfg,
 		logger:  logger,
@@ -56,16 +74,34 @@ func New(cfg Config) *Server {
 		queue:   make(chan types.QueueItem, 100),
 	}
 
-	// Initialize LLM client
-	s.llmClient = llm.NewClient(cfg.OllamaHost, cfg.ClaudeKey, logger)
+	// Durable queue. If it cannot be created we log loudly and continue with
+	// the in-memory channel only, rather than refusing to accept messages.
+	durable, err := queue.New(cfg.DataDir, logger)
+	if err != nil {
+		logger.Error("failed to initialise durable queue; items will not survive restart",
+			zap.Error(err))
+	} else {
+		s.durable = durable
+	}
+
+	// Initialize LLM client. Use the options constructor so AllowMock is
+	// explicit rather than defaulted.
+	s.llmClient = llm.NewClientWithOptions(llm.Config{
+		OllamaHost: cfg.OllamaHost,
+		ClaudeKey:  cfg.ClaudeKey,
+		Logger:     logger,
+		AllowMock:  cfg.AllowMock,
+	})
 
 	// Initialize pipeline
 	s.pipeline = pipeline.New(pipeline.Config{
-		DataDir:     cfg.DataDir,
-		Logger:      logger,
-		OllamaHost:  cfg.OllamaHost,
-		WhisperPath: cfg.WhisperPath,
-		LLMClient:   s.llmClient,
+		DataDir:      cfg.DataDir,
+		Logger:       logger,
+		OllamaHost:   cfg.OllamaHost,
+		WhisperPath:  cfg.WhisperPath,
+		WhisperModel: cfg.WhisperModel,
+		AllowMock:    cfg.AllowMock,
+		LLMClient:    s.llmClient,
 	})
 
 	return s
@@ -134,7 +170,10 @@ func (s *Server) HandleVoiceUpload(c *gin.Context) {
 		Timestamp: time.Now(),
 	}
 
-	s.enqueue(item)
+	if err := s.enqueue(item); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to queue item"})
+		return
+	}
 
 	c.JSON(http.StatusAccepted, gin.H{"status": "queued", "id": item.ID})
 }
@@ -180,27 +219,72 @@ func (s *Server) HandleVideoUpload(c *gin.Context) {
 		item.Source = "api"
 	}
 
-	s.enqueue(item)
+	if err := s.enqueue(item); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to queue item"})
+		return
+	}
 
 	c.JSON(http.StatusAccepted, gin.H{"status": "queued", "id": item.ID})
 }
 
-// StartPipeline starts the background processing pipeline
+// StartPipeline starts the background processing pipeline.
+//
+// Work runs on a fixed pool of Workers goroutines (default 1) instead of one
+// unbounded goroutine per item. Each item triggers an 8B extract plus an 8B
+// critic pass, and the target GPU holds exactly one such model, so unbounded
+// fan-out meant thrash or OOM under any burst.
 func (s *Server) StartPipeline(ctx context.Context) {
-	s.logger.Info("starting background pipeline")
+	workers := s.config.Workers
+	if workers < 1 {
+		workers = 1
+	}
+	s.logger.Info("starting background pipeline", zap.Int("workers", workers))
 
-	for {
+	// Resume anything left pending by a previous run before taking new work.
+	s.replayPending()
+
+	for i := 0; i < workers; i++ {
+		s.wg.Add(1)
+		go func(worker int) {
+			defer s.wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case item := <-s.queue:
+					s.logger.Debug("worker picked up item",
+						zap.Int("worker", worker), zap.String("id", item.ID))
+					s.processItem(ctx, item)
+				}
+			}
+		}(i)
+	}
+
+	<-ctx.Done()
+	s.logger.Info("pipeline shutting down; draining in-flight work")
+	s.wg.Wait()
+	s.logger.Info("pipeline drained")
+}
+
+// replayPending re-queues every item the durable queue still lists as pending.
+func (s *Server) replayPending() {
+	if s.durable == nil {
+		return
+	}
+	items, err := s.durable.Replay()
+	if err != nil {
+		s.logger.Error("failed to replay persisted queue", zap.Error(err))
+		return
+	}
+	for _, item := range items {
 		select {
-		case <-ctx.Done():
-			s.logger.Info("pipeline shutting down")
-			s.wg.Wait()
-			return
-		case item := <-s.queue:
-			s.wg.Add(1)
-			go func(item types.QueueItem) {
-				defer s.wg.Done()
-				s.processItem(ctx, item)
-			}(item)
+		case s.queue <- item:
+			s.logger.Info("replayed queue item", zap.String("id", item.ID))
+		default:
+			// Channel full: it stays on disk and will be picked up by the
+			// next replay. Nothing is lost.
+			s.logger.Warn("replay deferred, queue full; item remains persisted",
+				zap.String("id", item.ID))
 		}
 	}
 }
@@ -232,6 +316,14 @@ func (s *Server) processItem(ctx context.Context, item types.QueueItem) {
 			zap.String("id", item.ID),
 			zap.Error(err),
 		)
+		// Record the failure durably. The media file and the failure record
+		// both survive, so the item can be retried once the cause is fixed.
+		if s.durable != nil {
+			if ferr := s.durable.Fail(item, err); ferr != nil {
+				s.logger.Error("failed to record queue failure",
+					zap.String("id", item.ID), zap.Error(ferr))
+			}
+		}
 		return
 	}
 
@@ -247,20 +339,42 @@ func (s *Server) processItem(ctx context.Context, item types.QueueItem) {
 		}
 	}
 
+	if s.durable != nil {
+		if cerr := s.durable.Complete(item); cerr != nil {
+			s.logger.Warn("failed to mark queue item complete",
+				zap.String("id", item.ID), zap.Error(cerr))
+		}
+	}
+
 	s.logger.Info("item processed",
 		zap.String("id", item.ID),
 		zap.Int("items_extracted", len(result.Items)),
 	)
 }
 
-// enqueue adds an item to the processing queue
-func (s *Server) enqueue(item types.QueueItem) {
+// enqueue accepts an item for processing.
+//
+// The item is persisted to disk BEFORE this returns, so it survives a crash or
+// restart. It is never dropped: if the in-memory channel is full the item stays
+// on disk and is picked up by the next replay. The previous implementation
+// discarded items on a full channel with only a warning.
+func (s *Server) enqueue(item types.QueueItem) error {
+	if s.durable != nil {
+		if err := s.durable.Persist(item); err != nil {
+			s.logger.Error("failed to persist queue item; refusing to accept",
+				zap.String("id", item.ID), zap.Error(err))
+			return err
+		}
+	}
+
 	select {
 	case s.queue <- item:
 		s.logger.Info("item queued", zap.String("id", item.ID))
 	default:
-		s.logger.Warn("queue full, dropping item", zap.String("id", item.ID))
+		s.logger.Warn("in-memory queue full; item persisted and will be replayed",
+			zap.String("id", item.ID))
 	}
+	return nil
 }
 
 // handleTelegramMessage processes a Telegram message
@@ -303,7 +417,10 @@ func (s *Server) handleTelegramMessage(msg *TelegramMessage) {
 		return
 	}
 
-	s.enqueue(item)
+	if err := s.enqueue(item); err != nil {
+		s.logger.Error("failed to queue telegram message",
+			zap.String("id", item.ID), zap.Error(err))
+	}
 }
 
 // downloadTelegramFile downloads a file from Telegram
@@ -362,14 +479,14 @@ func (s *Server) downloadTelegramFile(fileID string, ext string) (string, error)
 
 // TelegramUpdate represents a Telegram webhook update
 type TelegramUpdate struct {
-	UpdateID int             `json:"update_id"`
+	UpdateID int              `json:"update_id"`
 	Message  *TelegramMessage `json:"message,omitempty"`
 }
 
 // TelegramMessage represents a Telegram message
 type TelegramMessage struct {
-	MessageID int    `json:"message_id"`
-	Date      int    `json:"date"`
+	MessageID int `json:"message_id"`
+	Date      int `json:"date"`
 	Chat      struct {
 		ID int64 `json:"id"`
 	} `json:"chat"`

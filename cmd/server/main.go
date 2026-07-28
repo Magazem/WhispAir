@@ -27,9 +27,36 @@ func main() {
 	viper.AddConfigPath("$HOME/.memoire")
 	viper.AddConfigPath(".")
 
-	// Environment variables override
+	// Environment variables override.
+	//
+	// AutomaticEnv alone was not enough: viper looks up the key verbatim, so
+	// "data.dir" became "MEMOIRE_DATA.DIR" - not a legal environment variable
+	// name. Every variable documented in .env.example was therefore silently
+	// ignored, including TG_BOT_TOKEN. The replacer maps dots to underscores so
+	// MEMOIRE_DATA_DIR, MEMOIRE_SERVER_PORT and MEMOIRE_LOG_LEVEL work.
 	viper.SetEnvPrefix("MEMOIRE")
+	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	viper.AutomaticEnv()
+
+	// Bind the unprefixed names that .env.example and SETUP.md document, so the
+	// documented configuration actually reaches the keys the code reads.
+	for key, envs := range map[string][]string{
+		"tg.bot_token":   {"MEMOIRE_TG_BOT_TOKEN", "TG_BOT_TOKEN"},
+		"tg.bot_api_url": {"MEMOIRE_TG_BOT_API_URL", "TG_BOT_API_URL"},
+		"ollama.host":    {"MEMOIRE_OLLAMA_HOST", "OLLAMA_HOST"},
+		"whisper.path":   {"MEMOIRE_WHISPER_PATH", "WHISPER_PATH"},
+		"whisper.model":  {"MEMOIRE_WHISPER_MODEL", "WHISPER_MODEL"},
+		"claude.api_key": {"MEMOIRE_CLAUDE_API_KEY", "CLAUDE_API_KEY"},
+		"data.dir":       {"MEMOIRE_DATA_DIR"},
+		"server.host":    {"MEMOIRE_SERVER_HOST"},
+		"server.port":    {"MEMOIRE_SERVER_PORT"},
+		"log.level":      {"MEMOIRE_LOG_LEVEL"},
+	} {
+		args := append([]string{key}, envs...)
+		if err := viper.BindEnv(args...); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to bind env for %s: %v\n", key, err)
+		}
+	}
 
 	// Defaults
 	viper.SetDefault("server.port", "8080")

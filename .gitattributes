@@ -1,0 +1,23 @@
+# Go tooling (gofmt, go vet) treats CRLF files as unformatted. With
+# core.autocrlf=true and no .gitattributes, every file that had been through a
+# checkout showed up in `gofmt -l`, which made the check useless as a signal.
+# Pin all text to LF in the working tree so formatting checks mean something.
+* text=auto eol=lf
+
+*.go            text eol=lf
+*.md            text eol=lf
+*.json          text eol=lf
+*.yaml          text eol=lf
+*.yml           text eol=lf
+*.sh            text eol=lf
+Makefile        text eol=lf
+*.service       text eol=lf
+.gitignore      text eol=lf
+.gitattributes  text eol=lf
+
+# Binaries and models must never be line-ending converted.
+*.bin  binary
+*.exe  binary
+*.ogg  binary
+*.mp4  binary
+*.wav  binary

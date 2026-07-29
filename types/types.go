@@ -28,12 +28,15 @@ type ExtractedItem struct {
 	Type   string `json:"type"`
 	Text   string `json:"text"`
 	Target string `json:"target"`
+	// Confidence carries the classifier's confidence for this item.
+	// Zero means "unknown" and is omitted from AI markers.
+	Confidence float64 `json:"confidence"`
 }
 
 // PipelineResult from the pipeline processing
 type PipelineResult struct {
-	RawText        string           `json:"raw_text"`
-	Classification Classification   `json:"classification"`
-	Items          []ExtractedItem  `json:"items"`
-	Confidence     float64          `json:"confidence"`
+	RawText        string          `json:"raw_text"`
+	Classification Classification  `json:"classification"`
+	Items          []ExtractedItem `json:"items"`
+	Confidence     float64         `json:"confidence"`
 }

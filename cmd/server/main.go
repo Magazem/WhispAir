@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -26,9 +27,36 @@ func main() {
 	viper.AddConfigPath("$HOME/.memoire")
 	viper.AddConfigPath(".")
 
-	// Environment variables override
+	// Environment variables override.
+	//
+	// AutomaticEnv alone was not enough: viper looks up the key verbatim, so
+	// "data.dir" became "MEMOIRE_DATA.DIR" - not a legal environment variable
+	// name. Every variable documented in .env.example was therefore silently
+	// ignored, including TG_BOT_TOKEN. The replacer maps dots to underscores so
+	// MEMOIRE_DATA_DIR, MEMOIRE_SERVER_PORT and MEMOIRE_LOG_LEVEL work.
 	viper.SetEnvPrefix("MEMOIRE")
+	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	viper.AutomaticEnv()
+
+	// Bind the unprefixed names that .env.example and SETUP.md document, so the
+	// documented configuration actually reaches the keys the code reads.
+	for key, envs := range map[string][]string{
+		"tg.bot_token":   {"MEMOIRE_TG_BOT_TOKEN", "TG_BOT_TOKEN"},
+		"tg.bot_api_url": {"MEMOIRE_TG_BOT_API_URL", "TG_BOT_API_URL"},
+		"ollama.host":    {"MEMOIRE_OLLAMA_HOST", "OLLAMA_HOST"},
+		"whisper.path":   {"MEMOIRE_WHISPER_PATH", "WHISPER_PATH"},
+		"whisper.model":  {"MEMOIRE_WHISPER_MODEL", "WHISPER_MODEL"},
+		"claude.api_key": {"MEMOIRE_CLAUDE_API_KEY", "CLAUDE_API_KEY"},
+		"data.dir":       {"MEMOIRE_DATA_DIR"},
+		"server.host":    {"MEMOIRE_SERVER_HOST"},
+		"server.port":    {"MEMOIRE_SERVER_PORT"},
+		"log.level":      {"MEMOIRE_LOG_LEVEL"},
+	} {
+		args := append([]string{key}, envs...)
+		if err := viper.BindEnv(args...); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to bind env for %s: %v\n", key, err)
+		}
+	}
 
 	// Defaults
 	viper.SetDefault("server.port", "8080")
@@ -37,6 +65,11 @@ func main() {
 	viper.SetDefault("log.level", "info")
 	viper.SetDefault("ollama.host", "http://localhost:11434")
 	viper.SetDefault("tg.bot_api_url", "http://localhost:8081")
+	// One pipeline worker by default: the target GPU holds a single 8B model.
+	viper.SetDefault("pipeline.workers", 1)
+	// Mocks are off unless explicitly enabled. Mock output is
+	// indistinguishable from real captured thought once it reaches the notes.
+	viper.SetDefault("mock.enabled", false)
 
 	// Load .env if present
 	if _, err := os.Stat(".env"); err == nil {
@@ -67,11 +100,29 @@ func main() {
 	}
 	defer logger.Sync()
 
-	// Resolve and create data directory
-	dataDir := viper.GetString("data.dir")
+	// Resolve and create data directory.
+	//
+	// Viper does not expand shell variables and filepath.Abs only resolves
+	// against the CWD, so the old code turned the "$HOME/memoire-data" default
+	// into a directory LITERALLY NAMED "$HOME". That is how 11 personal notes
+	// ended up committed into the repository.
+	dataDir, err := expandHome(viper.GetString("data.dir"))
+	if err != nil {
+		logger.Fatal("failed to resolve data dir", zap.Error(err))
+	}
 	dataDir, err = filepath.Abs(dataDir)
 	if err != nil {
 		logger.Fatal("failed to resolve data dir", zap.Error(err))
+	}
+
+	// Warn if the artifact of the old bug is still lying around, so its
+	// contents are not silently orphaned.
+	if st, statErr := os.Stat("$HOME"); statErr == nil && st.IsDir() {
+		logger.Warn("found a literal '$HOME' directory left by an earlier bug; "+
+			"your notes may be in there rather than in the real data dir",
+			zap.String("stray", mustAbs("$HOME")),
+			zap.String("real_data_dir", dataDir),
+		)
 	}
 
 	subdirs := []string{
@@ -97,15 +148,31 @@ func main() {
 		zap.String("data_dir", dataDir),
 	)
 
+	// Mock mode must be opted into explicitly, and must be impossible to miss
+	// in the logs when it is on.
+	allowMock := viper.GetBool("mock.enabled") || os.Getenv("MEMOIRE_MOCK") == "1"
+	if allowMock {
+		logger.Warn("MOCK MODE ENABLED - transcription and LLM output are FABRICATED " +
+			"and will be written to your notes; do not use this for real capture")
+	}
+
+	whisperModel := viper.GetString("whisper.model")
+	if whisperModel == "" {
+		whisperModel = os.Getenv("WHISPER_MODEL")
+	}
+
 	// Initialize server
 	srv := server.New(server.Config{
-		DataDir:     dataDir,
-		Logger:      logger,
-		BotToken:    viper.GetString("tg.bot_token"),
-		BotAPIURL:   viper.GetString("tg.bot_api_url"),
-		OllamaHost:  viper.GetString("ollama.host"),
-		WhisperPath: viper.GetString("whisper.path"),
-		ClaudeKey:   viper.GetString("claude.api_key"),
+		DataDir:      dataDir,
+		Logger:       logger,
+		BotToken:     viper.GetString("tg.bot_token"),
+		BotAPIURL:    viper.GetString("tg.bot_api_url"),
+		OllamaHost:   viper.GetString("ollama.host"),
+		WhisperPath:  viper.GetString("whisper.path"),
+		WhisperModel: whisperModel,
+		ClaudeKey:    viper.GetString("claude.api_key"),
+		AllowMock:    allowMock,
+		Workers:      viper.GetInt("pipeline.workers"),
 	})
 
 	// Register plugins
@@ -220,6 +287,46 @@ func corsMiddleware() gin.HandlerFunc {
 
 		c.Next()
 	}
+}
+
+// expandHome expands a leading "$HOME", "${HOME}" or "~" in a path.
+//
+// This is the fix for the bug that created a directory literally named
+// "$HOME": neither viper nor filepath.Abs performs this expansion.
+func expandHome(path string) (string, error) {
+	if path == "" {
+		return "", fmt.Errorf("empty path")
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		if h := os.Getenv("HOME"); h != "" {
+			home = h
+		} else if h := os.Getenv("USERPROFILE"); h != "" {
+			home = h
+		} else {
+			return "", fmt.Errorf("cannot resolve home directory: %w", err)
+		}
+	}
+
+	for _, prefix := range []string{"$HOME", "${HOME}", "~"} {
+		if path == prefix {
+			return home, nil
+		}
+		if strings.HasPrefix(path, prefix+"/") || strings.HasPrefix(path, prefix+"\\") {
+			return filepath.Join(home, path[len(prefix)+1:]), nil
+		}
+	}
+
+	// Expand any remaining environment variables (e.g. $XDG_DATA_HOME).
+	return os.ExpandEnv(path), nil
+}
+
+func mustAbs(p string) string {
+	if abs, err := filepath.Abs(p); err == nil {
+		return abs
+	}
+	return p
 }
 
 func ensureFile(path, header string) {

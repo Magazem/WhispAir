@@ -110,9 +110,15 @@ func TestPipelineVoiceMessage(t *testing.T) {
 	os.WriteFile(mockAudio, []byte("mock audio data"), 0644)
 
 	logger := zap.NewNop()
+	// AllowMock must be set explicitly now. This test exercises the pipeline
+	// plumbing (transcript preservation, extraction, routing) rather than real
+	// transcription, and there is no whisper binary in CI. Without this the
+	// pipeline correctly refuses to invent a transcript - see
+	// TestVoiceWithoutMockFailsAndWritesNothing.
 	p := pipeline.New(pipeline.Config{
-		DataDir: dataDir,
-		Logger:  logger,
+		DataDir:   dataDir,
+		Logger:    logger,
+		AllowMock: true,
 	})
 
 	item := types.QueueItem{
@@ -145,6 +151,67 @@ func TestPipelineVoiceMessage(t *testing.T) {
 	}
 
 	t.Logf("Voice result: %d items, raw text: %q", len(result.Items), result.RawText)
+}
+
+// TestVoiceWithoutMockFailsAndWritesNothing is the regression guard for the
+// worst defect in the original system: a failed transcription was replaced with
+// invented text, which then flowed through extraction into the user's real
+// notes carrying an AI marker. A failure must now abort the item and leave the
+// notes completely untouched.
+func TestVoiceWithoutMockFailsAndWritesNothing(t *testing.T) {
+	dataDir, err := os.MkdirTemp("", "memoire-test-failloud-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dataDir)
+
+	mediaDir := filepath.Join(dataDir, "media")
+	os.MkdirAll(mediaDir, 0755)
+	audio := filepath.Join(mediaDir, "voice_msg-test.ogg")
+	os.WriteFile(audio, []byte("not real audio"), 0644)
+
+	// Point the transcriber at a model that does not exist so transcription
+	// cannot succeed, with mocks off (the default).
+	p := pipeline.New(pipeline.Config{
+		DataDir:      dataDir,
+		Logger:       zap.NewNop(),
+		WhisperModel: filepath.Join(dataDir, "no-such-model.bin"),
+	})
+
+	item := types.QueueItem{
+		ID:        "test_voice_failloud",
+		Type:      "voice",
+		Source:    "test",
+		MediaPath: audio,
+		Timestamp: time.Now(),
+	}
+
+	result, err := p.Process(context.Background(), item)
+	if err == nil {
+		t.Fatalf("expected the pipeline to fail when transcription fails, got result %+v", result)
+	}
+	if result != nil {
+		t.Errorf("expected a nil result on failure, got %+v", result)
+	}
+
+	// Nothing may have been written to any note file.
+	for _, name := range []string{"Review.md", "Chat.md", "Later.md"} {
+		path := filepath.Join(dataDir, name)
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			continue // never created at all, which is also correct
+		}
+		if len(data) > 0 {
+			t.Errorf("%s should be empty after a failed transcription, got %d bytes: %q",
+				name, len(data), string(data))
+		}
+	}
+
+	// And no fabricated transcript may have been preserved.
+	transcript := filepath.Join(dataDir, "media", "transcripts", "test_voice_failloud.txt")
+	if _, statErr := os.Stat(transcript); statErr == nil {
+		t.Errorf("no transcript should be saved when transcription fails: %s", transcript)
+	}
 }
 
 // TestPipelineJournalMessage tests processing a journal entry
